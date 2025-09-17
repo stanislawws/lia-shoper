@@ -28,26 +28,21 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Build feeds
+
+      # DIAGNOSTYKA: sprawdźmy nagłówki i pierwsze 500 bajtów odpowiedzi
+      - name: Debug: HEAD + first bytes from source feed
         env:
           SOURCE_FEED_URL: ${{ secrets.SOURCE_FEED_URL }}
-          STORE_CODE: ${{ secrets.STORE_CODE }}
-          DEFAULT_AVAILABILITY: in_stock
-          OUT_BASENAME: local_inventory
         run: |
-          python tools/build_local_inventory.py
-      - name: Upload artifact to Pages
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist
+          URL="$SOURCE_FEED_URL"
+          if ! [[ "$URL" =~ ^https?:// ]]; then URL="https://$URL"; fi
+          echo "Checking URL: $URL"
+          echo "---- HEAD ----"
+          curl -I -L --max-time 60 "$URL" || true
+          echo "---- FIRST 500 BYTES ----"
+          curl -L --max-time 60 -sS "$URL" | head -c 500 | sed -e 's/[[:cntrl:]]//g' || true
+          echo
+          echo "---- END ----"
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Build feeds
+        env:
