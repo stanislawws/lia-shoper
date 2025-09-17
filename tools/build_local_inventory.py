@@ -37,6 +37,7 @@ _ALLOWED_AVAIL = {
     "on_display_to_order": "on_display_to_order",
     "limited availability": "limited_availability",
     "limited_availability": "limited_availability",
+    # polskie warianty na wszelki wypadek
     "dostępny": "in_stock",
     "niedostępny": "out_of_stock",
     "brak": "out_of_stock",
@@ -56,7 +57,6 @@ def _decompress_if_needed(data: bytes, encoding: str) -> bytes:
         if "gzip" in enc:
             return gzip.decompress(data)
         if "deflate" in enc:
-            import zlib
             try:
                 return zlib.decompress(data, -zlib.MAX_WBITS)
             except zlib.error:
@@ -112,6 +112,8 @@ def fetch_xml(url: str) -> ET.ElementTree:
 def extract_items(tree: ET.ElementTree):
     root = tree.getroot()
     items = []
+
+    # 1) klasyczny RSS: rss/channel/item
     for it in root.findall(".//item"):
         gid = it.findtext("g:id", default=None, namespaces=NS) or it.findtext("id")
         if not gid:
@@ -124,22 +126,25 @@ def extract_items(tree: ET.ElementTree):
             "price": price.strip() if price else None,
         })
 
+    # 2) fallback bez niedozwolonego XPath-a:
+    #    przejdź po wszystkich węzłach i bierz tylko te, które mają BEZPOŚREDNIE dziecko <g:id>
     if not items:
-        for node in root.findall(".//*[@*]"):
-            gid = node.findtext("g:id", default=None, namespaces=NS)
-            if gid:
-                availability = None
-                price = None
-                for cand in [node, *list(node)]:
-                    if availability is None:
-                        availability = cand.findtext("g:availability", default=None, namespaces=NS)
-                    if price is None:
-                        price = cand.findtext("g:price", default=None, namespaces=NS)
-                items.append({
-                    "id": gid.strip(),
-                    "availability": normalize_availability(availability) if availability else DEFAULT_AVAILABILITY,
-                    "price": price.strip() if price else None,
-                })
+        seen = set()
+        for node in root.iter():
+            gid_el = node.find("g:id", NS)
+            if gid_el is None or not (gid_el.text and gid_el.text.strip()):
+                continue
+            gid = gid_el.text.strip()
+            if gid in seen:
+                continue
+            availability = node.findtext("g:availability", default=None, namespaces=NS)
+            price = node.findtext("g:price", default=None, namespaces=NS)
+            items.append({
+                "id": gid,
+                "availability": normalize_availability(availability) if availability else DEFAULT_AVAILABILITY,
+                "price": price.strip() if price else None,
+            })
+            seen.add(gid)
 
     if not items:
         raise RuntimeError("No items with <g:id> found in source feed (unexpected source structure)")
