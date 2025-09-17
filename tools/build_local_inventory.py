@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Buduje Local Inventory feed (XML + TSV) na podstawie standardowego feedu Google (XML) z Shopera.
-Wymagane zmienne środowiskowe:
-- SOURCE_FEED_URL – URL do standardowego feedu Shopera
+
+Wymagane zmienne środowiskowe (ustaw jako GitHub Secrets):
+- SOURCE_FEED_URL – pełny URL do standardowego feedu Shopera (z protokołem, np. https://...)
 - STORE_CODE      – kod sklepu identyczny z tym w Merchant Center / Google Business Profile (np. MAIN)
+
 Opcjonalne:
 - DEFAULT_AVAILABILITY – domyślna dostępność, gdy brak w źródle (domyślnie: in_stock)
 - OUT_BASENAME         – nazwa bazowa plików w dist/ (domyślnie: local_inventory)
@@ -24,7 +26,7 @@ if not SOURCE_FEED_URL or not STORE_CODE:
     print("ERROR: missing SOURCE_FEED_URL or STORE_CODE env vars", file=sys.stderr)
     sys.exit(2)
 
-# --- Helpers ---
+# --- Mapowanie akceptowanych wartości availability przez Google ---
 _ALLOWED_AVAIL = {
     "in stock": "in_stock",
     "in_stock": "in_stock",
@@ -45,14 +47,50 @@ def normalize_availability(val: str) -> str:
     return _ALLOWED_AVAIL.get(key, DEFAULT_AVAILABILITY)
 
 def fetch_xml(url: str) -> ET.ElementTree:
-    req = Request(url, headers={"User-Agent": "LIA-Builder/1.0"})
-    with urlopen(req, timeout=60) as resp:
-        data = resp.read()
-    return ET.ElementTree(ET.fromstring(data))
+    # Upewnij się, że jest protokół (https://) – często w sekretach zostaje sam host/ścieżka
+    if not re.match(r'^https?://', url, re.I):
+        url = 'https://' + url
+
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LIA-Builder/1.0)",
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",  # bez kompresji – prostszy debug
+        },
+    )
+
+    last_err = None
+    for attempt in range(3):  # proste retry z backoffem
+        try:
+            with urlopen(req, timeout=60) as resp:
+                status = getattr(resp, "status", 200)
+                ctype = resp.headers.get("Content-Type", "")
+                data = resp.read()
+
+            # Szybka walidacja – czy to na pewno XML (a nie HTML/strona logowania)
+            if not data.strip().startswith(b"<"):
+                snippet = data[:200].decode("utf-8", "replace")
+                raise RuntimeError(
+                    f"Unexpected response (status {status}, content-type {ctype}). "
+                    f"First bytes:\n{snippet}"
+                )
+
+            return ET.ElementTree(ET.fromstring(data))
+
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                import time
+                time.sleep(2 * (attempt + 1))  # 2s, 4s
+            else:
+                print(f"ERROR: failed to fetch XML from {url!r}: {e}", file=sys.stderr)
+                raise
 
 def extract_items(tree: ET.ElementTree):
     root = tree.getroot()
     items = []
+    # Szukamy struktury RSS (rss/channel/item); Shoper zwykle tak podaje Google feed
     for it in root.findall(".//item"):
         gid = it.findtext("g:id", default=None, namespaces=NS) or it.findtext("id")
         if not gid:
@@ -103,7 +141,6 @@ def main():
     tree = fetch_xml(SOURCE_FEED_URL)
     items = extract_items(tree)
     outdir = ensure_dist()
-    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
     xml_out = outdir / f"{OUT_BASENAME}.xml"
     tsv_out = outdir / f"{OUT_BASENAME}.tsv"
