@@ -29,8 +29,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # DIAGNOSTYKA: sprawdźmy nagłówki i pierwsze 500 bajtów odpowiedzi
-      - name: Debug: HEAD + first bytes from source feed
+      - name: "Debug: HEAD + first bytes from source feed"
         env:
           SOURCE_FEED_URL: ${{ secrets.SOURCE_FEED_URL }}
         run: |
