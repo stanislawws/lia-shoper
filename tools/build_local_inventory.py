@@ -1,154 +1,70 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Buduje Local Inventory feed (XML + TSV) na podstawie standardowego feedu Google (XML) z Shopera.
+name: Build & Publish Local Inventory (Pages)
 
-Wymagane zmienne środowiskowe (ustaw jako GitHub Secrets):
-- SOURCE_FEED_URL – pełny URL do standardowego feedu Shopera (z protokołem, np. https://...)
-- STORE_CODE      – kod sklepu identyczny z tym w Merchant Center / Google Business Profile (np. MAIN)
+on:
+  schedule:
+    - cron: '30 3 * * *'   # codziennie 03:30 UTC (~05:30 PL)
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+    paths:
+      - 'tools/**'
+      - '.github/workflows/local-inventory-pages.yml'
+      - 'README.md'
 
-Opcjonalne:
-- DEFAULT_AVAILABILITY – domyślna dostępność, gdy brak w źródle (domyślnie: in_stock)
-- OUT_BASENAME         – nazwa bazowa plików w dist/ (domyślnie: local_inventory)
-"""
-import os, sys, io, csv, re, datetime, pathlib
-import xml.etree.ElementTree as ET
-from urllib.request import urlopen, Request
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
-NS = {"g": "http://base.google.com/ns/1.0"}
+concurrency:
+  group: 'pages'
+  cancel-in-progress: true
 
-SOURCE_FEED_URL = os.environ.get("SOURCE_FEED_URL")
-STORE_CODE = os.environ.get("STORE_CODE")
-DEFAULT_AVAILABILITY = os.environ.get("DEFAULT_AVAILABILITY", "in_stock")
-OUT_BASENAME = os.environ.get("OUT_BASENAME", "local_inventory")
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-if not SOURCE_FEED_URL or not STORE_CODE:
-    print("ERROR: missing SOURCE_FEED_URL or STORE_CODE env vars", file=sys.stderr)
-    sys.exit(2)
+      # DIAGNOSTYKA: sprawdźmy nagłówki i pierwsze 500 bajtów odpowiedzi
+      - name: Debug: HEAD + first bytes from source feed
+        env:
+          SOURCE_FEED_URL: ${{ secrets.SOURCE_FEED_URL }}
+        run: |
+          URL="$SOURCE_FEED_URL"
+          if ! [[ "$URL" =~ ^https?:// ]]; then URL="https://$URL"; fi
+          echo "Checking URL: $URL"
+          echo "---- HEAD ----"
+          curl -I -L --max-time 60 "$URL" || true
+          echo "---- FIRST 500 BYTES ----"
+          curl -L --max-time 60 -sS "$URL" | head -c 500 | sed -e 's/[[:cntrl:]]//g' || true
+          echo
+          echo "---- END ----"
 
-# --- Mapowanie akceptowanych wartości availability przez Google ---
-_ALLOWED_AVAIL = {
-    "in stock": "in_stock",
-    "in_stock": "in_stock",
-    "available": "in_stock",
-    "preorder": "preorder",
-    "out of stock": "out_of_stock",
-    "out_of_stock": "out_of_stock",
-    "on display to order": "on_display_to_order",
-    "on_display_to_order": "on_display_to_order",
-    "limited availability": "limited_availability",
-    "limited_availability": "limited_availability",
-}
+      - name: Build feeds
+        env:
+          SOURCE_FEED_URL: ${{ secrets.SOURCE_FEED_URL }}
+          STORE_CODE: ${{ secrets.STORE_CODE }}
+          DEFAULT_AVAILABILITY: in_stock
+          OUT_BASENAME: local_inventory
+        run: |
+          python tools/build_local_inventory.py
 
-def normalize_availability(val: str) -> str:
-    if not val:
-        return DEFAULT_AVAILABILITY
-    key = re.sub(r"\s+", " ", val.strip().lower())
-    return _ALLOWED_AVAIL.get(key, DEFAULT_AVAILABILITY)
+      - name: Upload artifact to Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
 
-def fetch_xml(url: str) -> ET.ElementTree:
-    # Upewnij się, że jest protokół (https://) – często w sekretach zostaje sam host/ścieżka
-    if not re.match(r'^https?://', url, re.I):
-        url = 'https://' + url
-
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; LIA-Builder/1.0)",
-            "Accept": "*/*",
-            "Accept-Encoding": "identity",  # bez kompresji – prostszy debug
-        },
-    )
-
-    last_err = None
-    for attempt in range(3):  # proste retry z backoffem
-        try:
-            with urlopen(req, timeout=60) as resp:
-                status = getattr(resp, "status", 200)
-                ctype = resp.headers.get("Content-Type", "")
-                data = resp.read()
-
-            # Szybka walidacja – czy to na pewno XML (a nie HTML/strona logowania)
-            if not data.strip().startswith(b"<"):
-                snippet = data[:200].decode("utf-8", "replace")
-                raise RuntimeError(
-                    f"Unexpected response (status {status}, content-type {ctype}). "
-                    f"First bytes:\n{snippet}"
-                )
-
-            return ET.ElementTree(ET.fromstring(data))
-
-        except Exception as e:
-            last_err = e
-            if attempt < 2:
-                import time
-                time.sleep(2 * (attempt + 1))  # 2s, 4s
-            else:
-                print(f"ERROR: failed to fetch XML from {url!r}: {e}", file=sys.stderr)
-                raise
-
-def extract_items(tree: ET.ElementTree):
-    root = tree.getroot()
-    items = []
-    # Szukamy struktury RSS (rss/channel/item); Shoper zwykle tak podaje Google feed
-    for it in root.findall(".//item"):
-        gid = it.findtext("g:id", default=None, namespaces=NS) or it.findtext("id")
-        if not gid:
-            continue
-        availability = it.findtext("g:availability", default=None, namespaces=NS) or it.findtext("availability")
-        price = it.findtext("g:price", default=None, namespaces=NS) or it.findtext("price")
-        items.append({
-            "id": gid.strip(),
-            "availability": normalize_availability(availability) if availability else DEFAULT_AVAILABILITY,
-            "price": price.strip() if price else None,
-        })
-    if not items:
-        raise RuntimeError("No <item> entries with g:id found in source feed")
-    return items
-
-def ensure_dist():
-    outdir = pathlib.Path("dist")
-    outdir.mkdir(parents=True, exist_ok=True)
-    return outdir
-
-def write_xml(items, outpath: pathlib.Path):
-    rss = ET.Element("rss", attrib={"version": "2.0"})
-    rss.set("xmlns:g", NS["g"])
-    channel = ET.SubElement(rss, "channel")
-    ET.SubElement(channel, "title").text = "Local Inventory Feed"
-    ET.SubElement(channel, "link").text = "https://example.invalid/"
-    ET.SubElement(channel, "description").text = "Generated by LIA Builder"
-
-    for it in items:
-        item = ET.SubElement(channel, "item")
-        ET.SubElement(item, ET.QName(NS["g"], "id")).text = it["id"]
-        ET.SubElement(item, ET.QName(NS["g"], "store_code")).text = STORE_CODE
-        ET.SubElement(item, ET.QName(NS["g"], "availability")).text = it["availability"]
-        if it.get("price"):
-            ET.SubElement(item, ET.QName(NS["g"], "price")).text = it["price"]
-
-    tree = ET.ElementTree(rss)
-    tree.write(outpath, encoding="utf-8", xml_declaration=True)
-
-def write_tsv(items, outpath: pathlib.Path):
-    with outpath.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f, delimiter="\t")
-        w.writerow(["id", "store_code", "availability", "price"])
-        for it in items:
-            w.writerow([it["id"], STORE_CODE, it["availability"], it.get("price") or ""])
-
-def main():
-    tree = fetch_xml(SOURCE_FEED_URL)
-    items = extract_items(tree)
-    outdir = ensure_dist()
-
-    xml_out = outdir / f"{OUT_BASENAME}.xml"
-    tsv_out = outdir / f"{OUT_BASENAME}.tsv"
-
-    write_xml(items, xml_out)
-    write_tsv(items, tsv_out)
-
-    print(f"Wrote: {xml_out} and {tsv_out} ({len(items)} rows)")
-
-if __name__ == "__main__":
-    main()
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
