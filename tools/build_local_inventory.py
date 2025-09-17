@@ -156,8 +156,10 @@ def ensure_dist():
     return outdir
 
 def write_xml(items, outpath: pathlib.Path):
+    # Wymuś, by elementy z URI Google miały prefiks "g", a nie "ns0"
+    ET.register_namespace('g', NS['g'])
+
     rss = ET.Element("rss", attrib={"version": "2.0"})
-    rss.set("xmlns:g", NS["g"])
     channel = ET.SubElement(rss, "channel")
     ET.SubElement(channel, "title").text = "Local Inventory Feed"
     ET.SubElement(channel, "link").text = "https://example.invalid/"
@@ -173,6 +175,7 @@ def write_xml(items, outpath: pathlib.Path):
 
     tree = ET.ElementTree(rss)
     tree.write(outpath, encoding="utf-8", xml_declaration=True)
+
 
 def write_tsv(items, outpath: pathlib.Path):
     with outpath.open("w", newline="", encoding="utf-8") as f:
