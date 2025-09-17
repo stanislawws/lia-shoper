@@ -1,0 +1,41 @@
+name: Build & Publish Local Inventory (Pages)
+
+
+on:
+schedule:
+- cron: '30 3 * * *' # codziennie 03:30 UTC (~05:30 w PL)
+workflow_dispatch: {}
+
+
+permissions:
+contents: read
+pages: write
+id-token: write
+
+
+jobs:
+build:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: actions/setup-python@v5
+with:
+python-version: '3.11'
+- name: Build feeds
+env:
+SOURCE_FEED_URL: ${{ secrets.SOURCE_FEED_URL }}
+STORE_CODE: ${{ secrets.STORE_CODE }}
+DEFAULT_AVAILABILITY: in_stock
+OUT_BASENAME: local_inventory
+run: |
+python tools/build_local_inventory.py
+- uses: actions/upload-pages-artifact@v3
+with:
+path: dist
+
+
+deploy:
+needs: build
+runs-on: ubuntu-latest
+steps:
+- uses: actions/deploy-pages@v4
